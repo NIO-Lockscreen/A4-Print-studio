@@ -1,0 +1,5 @@
+{
+  "name": "A4 Print Studio",
+  "description": "A tool to upload, scale, and print images to perfectly fill an A4 page.",
+  "requestFramePermissions": []
+}
