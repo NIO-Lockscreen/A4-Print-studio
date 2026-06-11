@@ -99,7 +99,21 @@ export default function App() {
   };
 
   const handlePrint = () => {
+    // The browser uses document.title as the default PDF / print filename.
+    // Temporarily switch it to "A4 Print" for the print dialog, then restore.
+    const originalTitle = document.title;
+    document.title = 'A4 Print';
+
+    const restoreTitle = () => {
+      document.title = originalTitle;
+      window.removeEventListener('afterprint', restoreTitle);
+    };
+    window.addEventListener('afterprint', restoreTitle);
+
     window.print();
+
+    // Fallback in case afterprint doesn't fire (some browsers).
+    setTimeout(restoreTitle, 1000);
   };
 
   const fitToPage = () => {
