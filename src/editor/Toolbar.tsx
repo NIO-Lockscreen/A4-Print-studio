@@ -1,5 +1,5 @@
 import React from 'react';
-import { MousePointer2, Paintbrush, Eraser, Minus, Square, Circle, Type, Undo2 } from 'lucide-react';
+import { MousePointer2, Paintbrush, Eraser, Minus, Square, Circle, Type, Undo2, PaintBucket } from 'lucide-react';
 import type { Tool } from './types';
 
 const TOOLS: { id: Tool; icon: React.ComponentType<{ size?: number }>; label: string }[] = [
@@ -21,6 +21,8 @@ interface ToolbarProps {
   onStrokeWidthChange: (width: number) => void;
   fontSize: number;
   onFontSizeChange: (size: number) => void;
+  shapeFill: boolean;
+  onShapeFillChange: (fill: boolean) => void;
   canUndo: boolean;
   onUndo: () => void;
 }
@@ -34,6 +36,8 @@ export default function Toolbar({
   onStrokeWidthChange,
   fontSize,
   onFontSizeChange,
+  shapeFill,
+  onShapeFillChange,
   canUndo,
   onUndo,
 }: ToolbarProps) {
@@ -107,6 +111,17 @@ export default function Toolbar({
                 className="w-32 accent-indigo-600"
               />
               <span className="text-xs font-mono text-slate-400 w-8 text-right">{strokeWidth}</span>
+              {(tool === 'rect' || tool === 'ellipse') && (
+                <button
+                  title={shapeFill ? 'Fylt form' : 'Kun omriss'}
+                  onClick={() => onShapeFillChange(!shapeFill)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors ${
+                    shapeFill ? 'bg-indigo-600 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <PaintBucket size={13} /> Fyll
+                </button>
+              )}
             </>
           )}
         </div>

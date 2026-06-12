@@ -1,25 +1,30 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2 } from 'lucide-react';
+import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2, Undo2, Scaling, Lock, LockOpen } from 'lucide-react';
 import Toolbar from './editor/Toolbar';
 import LayersPanel from './editor/LayersPanel';
 import type { Tool, Layer, TextItem } from './editor/types';
 
 interface ImageState {
   src: string;
-  scale: number;
   x: number;
   y: number;
+  width: number;
+  height: number;
   rotation: number;
+  natWidth: number;
+  natHeight: number;
 }
 
 type UndoEntry =
   | { kind: 'draw'; layerId: string; dataUrl: string }
-  | { kind: 'layers'; layers: Layer[] };
+  | { kind: 'layers'; layers: Layer[] }
+  | { kind: 'image'; image: ImageState | null };
 
 interface StrokeState {
   layerId: string;
   tool: Tool;
+  fill: boolean;
   startX: number;
   startY: number;
   lastX: number;
@@ -33,6 +38,16 @@ interface TextDragState {
   lastY: number;
   moved: boolean;
   before: Layer[];
+}
+
+interface ResizeDragState {
+  sx: 1 | -1;
+  sy: 1 | -1;
+  centerX: number;
+  centerY: number;
+  startW: number;
+  startH: number;
+  startImage: ImageState;
 }
 
 export default function App() {
@@ -52,6 +67,9 @@ export default function App() {
   const [imageVisible, setImageVisible] = useState(true);
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [undoDepth, setUndoDepth] = useState(0);
+  const [resizeMode, setResizeMode] = useState(false);
+  const [aspectLocked, setAspectLocked] = useState(true);
+  const [shapeFill, setShapeFill] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -61,6 +79,8 @@ export default function App() {
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const strokeRef = useRef<StrokeState | null>(null);
   const textDragRef = useRef<TextDragState | null>(null);
+  const resizeDragRef = useRef<ResizeDragState | null>(null);
+  const imageDragRef = useRef<{ startImage: ImageState; moved: boolean } | null>(null);
   const undoStack = useRef<UndoEntry[]>([]);
   const counters = useRef({ draw: 0, text: 0, id: 0 });
 
@@ -100,26 +120,43 @@ export default function App() {
     if (file) {
       const reader = new FileReader();
       reader.onload = (event) => {
-        if (event.target?.result) {
-          // Reset state for new image
+        const src = event.target?.result;
+        if (typeof src !== 'string') return;
+        // Read natural dimensions so transforms can work around the center.
+        const img = new Image();
+        img.onload = () => {
+          const natWidth = img.naturalWidth || 1;
+          const natHeight = img.naturalHeight || 1;
+          // Start contained within the page, centered.
+          const s = Math.min(1, A4_WIDTH_PX / natWidth, A4_HEIGHT_PX / natHeight);
+          const width = natWidth * s;
+          const height = natHeight * s;
+          pushUndo({ kind: 'image', image });
           setImage({
-            src: event.target.result as string,
-            scale: 1,
-            x: 0,
-            y: 0,
-            rotation: 0
+            src,
+            x: (A4_WIDTH_PX - width) / 2,
+            y: (A4_HEIGHT_PX - height) / 2,
+            width,
+            height,
+            rotation: 0,
+            natWidth,
+            natHeight,
           });
           setImageVisible(true);
-        }
+        };
+        img.src = src;
       };
       reader.readAsDataURL(file);
     }
+    // Clear the input so picking the same file again still fires onChange.
+    e.target.value = '';
   };
 
   const handleDragStart = (e: React.MouseEvent | React.TouchEvent) => {
     if (!image) return;
     if (advancedMode && tool !== 'move') return;
     setIsDragging(true);
+    imageDragRef.current = { startImage: image, moved: false };
     const clientX = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
     const clientY = 'touches' in e ? e.touches[0].clientY : (e as React.MouseEvent).clientY;
     setDragStart({ x: clientX, y: clientY });
@@ -135,6 +172,10 @@ export default function App() {
     const deltaX = (clientX - dragStart.x) / previewScale;
     const deltaY = (clientY - dragStart.y) / previewScale;
 
+    if (imageDragRef.current && (deltaX !== 0 || deltaY !== 0)) {
+      imageDragRef.current.moved = true;
+    }
+
     setImage({
       ...image,
       x: image.x + deltaX,
@@ -146,6 +187,11 @@ export default function App() {
 
   const handleDragEnd = () => {
     setIsDragging(false);
+    const drag = imageDragRef.current;
+    imageDragRef.current = null;
+    if (isDragging && drag?.moved) {
+      pushUndo({ kind: 'image', image: drag.startImage });
+    }
   };
 
   const handlePrint = () => {
@@ -167,36 +213,49 @@ export default function App() {
   };
 
   const fitToPage = () => {
-    if (!image || !canvasRef.current) return;
-
-    const img = new Image();
-    img.src = image.src;
-    img.onload = () => {
-      // Use the fixed A4 dimensions
-      const canvasWidth = A4_WIDTH_PX;
-      const canvasHeight = A4_HEIGHT_PX;
-
-      const scaleX = canvasWidth / img.width;
-      const scaleY = canvasHeight / img.height;
-
-      // "Cover" logic
-      const newScale = Math.max(scaleX, scaleY);
-
-      setImage({
-        ...image,
-        scale: newScale,
-        x: (canvasWidth - img.width * newScale) / 2,
-        y: (canvasHeight - img.height * newScale) / 2,
-        rotation: 0
-      });
-    };
+    if (!image) return;
+    pushUndo({ kind: 'image', image });
+    // "Cover" logic using the stored natural dimensions
+    const s = Math.max(A4_WIDTH_PX / image.natWidth, A4_HEIGHT_PX / image.natHeight);
+    const width = image.natWidth * s;
+    const height = image.natHeight * s;
+    setImage({
+      ...image,
+      width,
+      height,
+      x: (A4_WIDTH_PX - width) / 2,
+      y: (A4_HEIGHT_PX - height) / 2,
+      rotation: 0
+    });
   };
 
-  // Zoom controls for the IMAGE
-  const zoomIn = () => setImage(prev => prev ? { ...prev, scale: prev.scale * 1.1 } : null);
-  const zoomOut = () => setImage(prev => prev ? { ...prev, scale: prev.scale * 0.9 } : null);
-  const rotate = () => setImage(prev => prev ? { ...prev, rotation: (prev.rotation + 90) % 360 } : null);
-  const clear = () => setImage(null);
+  // Zoom controls for the IMAGE — scale around the image center
+  const zoomBy = (factor: number) => {
+    if (!image) return;
+    pushUndo({ kind: 'image', image });
+    const width = image.width * factor;
+    const height = image.height * factor;
+    setImage({
+      ...image,
+      width,
+      height,
+      x: image.x + (image.width - width) / 2,
+      y: image.y + (image.height - height) / 2,
+    });
+  };
+  const zoomIn = () => zoomBy(1.1);
+  const zoomOut = () => zoomBy(0.9);
+  const rotate = () => {
+    if (!image) return;
+    pushUndo({ kind: 'image', image });
+    setImage({ ...image, rotation: (image.rotation + 90) % 360 });
+  };
+  const clear = () => {
+    if (!image) return;
+    pushUndo({ kind: 'image', image });
+    setImage(null);
+    setResizeMode(false);
+  };
 
   // ---------- Advanced mode: layers ----------
 
@@ -296,6 +355,9 @@ export default function App() {
         ctx.drawImage(img, 0, 0);
       };
       img.src = entry.dataUrl;
+    } else if (entry.kind === 'image') {
+      setImage(entry.image);
+      if (entry.image) setImageVisible(true);
     } else {
       setLayers(entry.layers);
       if (!entry.layers.some(l => l.id === activeLayerId)) {
@@ -305,7 +367,6 @@ export default function App() {
   }, [activeLayerId]);
 
   useEffect(() => {
-    if (!advancedMode) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
         const target = e.target as HTMLElement;
@@ -316,7 +377,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [advancedMode, undo]);
+  }, [undo]);
 
   // ---------- Advanced mode: drawing ----------
 
@@ -341,11 +402,12 @@ export default function App() {
 
   const applyStrokeStyle = (ctx: CanvasRenderingContext2D, erase: boolean) => {
     ctx.strokeStyle = color;
+    ctx.fillStyle = color;
     ctx.lineWidth = strokeWidth;
     ctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
   };
 
-  const drawShape = (ctx: CanvasRenderingContext2D, shape: Tool, x0: number, y0: number, x1: number, y1: number) => {
+  const drawShape = (ctx: CanvasRenderingContext2D, shape: Tool, fill: boolean, x0: number, y0: number, x1: number, y1: number) => {
     ctx.beginPath();
     if (shape === 'line') {
       ctx.moveTo(x0, y0);
@@ -355,7 +417,11 @@ export default function App() {
     } else {
       ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
     }
-    ctx.stroke();
+    if (fill && shape !== 'line') {
+      ctx.fill();
+    } else {
+      ctx.stroke();
+    }
   };
 
   const clearPreviewCanvas = () => {
@@ -404,7 +470,7 @@ export default function App() {
     if (!canvas || !ctx) return;
 
     pushUndo({ kind: 'draw', layerId: layer.id, dataUrl: canvas.toDataURL() });
-    strokeRef.current = { layerId: layer.id, tool, startX: point.x, startY: point.y, lastX: point.x, lastY: point.y };
+    strokeRef.current = { layerId: layer.id, tool, fill: shapeFill, startX: point.x, startY: point.y, lastX: point.x, lastY: point.y };
 
     if (tool === 'brush' || tool === 'eraser') {
       applyStrokeStyle(ctx, tool === 'eraser');
@@ -439,9 +505,10 @@ export default function App() {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.strokeStyle = color;
+        ctx.fillStyle = color;
         ctx.lineWidth = strokeWidth;
         ctx.globalCompositeOperation = 'source-over';
-        drawShape(ctx, stroke.tool, stroke.startX, stroke.startY, point.x, point.y);
+        drawShape(ctx, stroke.tool, stroke.fill, stroke.startX, stroke.startY, point.x, point.y);
       }
     }
 
@@ -459,7 +526,7 @@ export default function App() {
       const ctx = getLayerCtx(stroke.layerId);
       if (ctx) {
         applyStrokeStyle(ctx, false);
-        drawShape(ctx, stroke.tool, stroke.startX, stroke.startY, stroke.lastX, stroke.lastY);
+        drawShape(ctx, stroke.tool, stroke.fill, stroke.startX, stroke.startY, stroke.lastX, stroke.lastY);
       }
     }
   };
@@ -511,6 +578,72 @@ export default function App() {
     }
   };
 
+  // ---------- Image resize handles ----------
+
+  const handleResizeStart = (e: React.PointerEvent<HTMLDivElement>, sx: 1 | -1, sy: 1 | -1) => {
+    if (!image) return;
+    e.stopPropagation();
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    resizeDragRef.current = {
+      sx,
+      sy,
+      centerX: image.x + image.width / 2,
+      centerY: image.y + image.height / 2,
+      startW: image.width,
+      startH: image.height,
+      startImage: image,
+    };
+  };
+
+  const handleResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = resizeDragRef.current;
+    if (!drag) return;
+    const p = getPagePoint(e);
+    // Vector from the image center to the pointer, in the image's
+    // unrotated frame so resizing follows the visible corners.
+    const rad = (-drag.startImage.rotation * Math.PI) / 180;
+    const vx = p.x - drag.centerX;
+    const vy = p.y - drag.centerY;
+    const lx = vx * Math.cos(rad) - vy * Math.sin(rad);
+    const ly = vx * Math.sin(rad) + vy * Math.cos(rad);
+
+    let width: number;
+    let height: number;
+    if (aspectLocked) {
+      const d0 = Math.hypot(drag.startW, drag.startH) / 2;
+      const f = Math.max(0.02, Math.hypot(lx, ly) / d0);
+      width = drag.startW * f;
+      height = drag.startH * f;
+    } else {
+      width = Math.max(20, lx * drag.sx * 2);
+      height = Math.max(20, ly * drag.sy * 2);
+    }
+
+    setImage(img => img ? {
+      ...img,
+      width,
+      height,
+      x: drag.centerX - width / 2,
+      y: drag.centerY - height / 2,
+    } : img);
+  };
+
+  const handleResizeEnd = () => {
+    const drag = resizeDragRef.current;
+    resizeDragRef.current = null;
+    if (drag) {
+      pushUndo({ kind: 'image', image: drag.startImage });
+    }
+  };
+
+  const RESIZE_CORNERS: { sx: 1 | -1; sy: 1 | -1; cursor: string }[] = [
+    { sx: -1, sy: -1, cursor: 'nwse-resize' },
+    { sx: 1, sy: -1, cursor: 'nesw-resize' },
+    { sx: -1, sy: 1, cursor: 'nesw-resize' },
+    { sx: 1, sy: 1, cursor: 'nwse-resize' },
+  ];
+
   const hasContent = image !== null || layers.length > 0;
 
   return (
@@ -542,7 +675,7 @@ export default function App() {
               <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-xs font-semibold uppercase text-slate-500 tracking-wider">Justering</span>
-                  <span className="text-xs font-mono text-slate-400">{(image.scale * 100).toFixed(0)}%</span>
+                  <span className="text-xs font-mono text-slate-400">{((image.width / image.natWidth) * 100).toFixed(0)}%</span>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2">
@@ -562,6 +695,31 @@ export default function App() {
                     <Maximize size={16} /> Fyll side
                   </button>
                 </div>
+
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  <button
+                    onClick={() => setResizeMode(v => !v)}
+                    className={`flex items-center justify-center gap-2 p-2 border rounded-lg transition-all text-sm font-medium ${
+                      resizeMode
+                        ? 'bg-indigo-600 border-indigo-600 text-white shadow'
+                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
+                    }`}
+                  >
+                    <Scaling size={16} /> Skaler
+                  </button>
+                  <button
+                    onClick={() => setAspectLocked(v => !v)}
+                    title={aspectLocked ? 'Størrelsesforhold er låst' : 'Størrelsesforhold er fritt'}
+                    className="flex items-center justify-center gap-2 p-2 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all text-sm font-medium text-slate-700"
+                  >
+                    {aspectLocked ? <Lock size={16} /> : <LockOpen size={16} />} {aspectLocked ? 'Låst' : 'Fri'}
+                  </button>
+                </div>
+                {resizeMode && (
+                  <p className="text-xs text-slate-400 mt-2">
+                    Dra i hjørnene på bildet for å endre størrelse.
+                  </p>
+                )}
               </div>
 
               <button
@@ -572,6 +730,14 @@ export default function App() {
               </button>
             </div>
           )}
+
+          <button
+            onClick={undo}
+            disabled={undoDepth === 0}
+            className="w-full flex items-center justify-center gap-2 p-3 rounded-xl transition-colors text-sm font-medium border bg-white border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white"
+          >
+            <Undo2 size={16} /> Angre
+          </button>
 
           <button
             onClick={toggleAdvanced}
@@ -638,6 +804,8 @@ export default function App() {
               onStrokeWidthChange={setStrokeWidth}
               fontSize={fontSize}
               onFontSizeChange={setFontSize}
+              shapeFill={shapeFill}
+              onShapeFillChange={setShapeFill}
               canUndo={undoDepth > 0}
               onUndo={undo}
             />
@@ -674,20 +842,28 @@ export default function App() {
         >
           {image && imageVisible && (
             <div
-              className="absolute cursor-move origin-top-left"
+              className="absolute cursor-move"
               onMouseDown={handleDragStart}
               onTouchStart={handleDragStart}
               style={{
-                transform: `translate(${image.x}px, ${image.y}px) scale(${image.scale}) rotate(${image.rotation}deg)`,
+                transform: `translate(${image.x}px, ${image.y}px)`,
+                width: image.width,
+                height: image.height,
                 willChange: 'transform',
               }}
             >
-              <img
-                src={image.src}
-                alt="Print preview"
-                className="max-w-none pointer-events-none select-none"
-                draggable={false}
-              />
+              {/* Rotation happens around the center so the image stays on the page */}
+              <div className="w-full h-full" style={{ transform: `rotate(${image.rotation}deg)` }}>
+                <img
+                  src={image.src}
+                  alt="Print preview"
+                  className="w-full h-full max-w-none pointer-events-none select-none"
+                  draggable={false}
+                />
+                {resizeMode && (
+                  <div className="no-print absolute inset-0 border-2 border-dashed border-indigo-400 pointer-events-none" />
+                )}
+              </div>
             </div>
           )}
 
@@ -782,6 +958,38 @@ export default function App() {
             />
           )}
         </div>
+
+        {/* Resize handles float above the page so they stay reachable even
+            when the image corners lie outside the A4 sheet */}
+        {image && imageVisible && resizeMode && !(advancedMode && tool !== 'move') &&
+          canvasRef.current && wrapperRef.current && (() => {
+            const pageRect = canvasRef.current.getBoundingClientRect();
+            const wrapRect = wrapperRef.current.getBoundingClientRect();
+            const rad = (image.rotation * Math.PI) / 180;
+            const centerX = image.x + image.width / 2;
+            const centerY = image.y + image.height / 2;
+            return RESIZE_CORNERS.map(({ sx, sy, cursor }) => {
+              const lx = (sx * image.width) / 2;
+              const ly = (sy * image.height) / 2;
+              const px = centerX + lx * Math.cos(rad) - ly * Math.sin(rad);
+              const py = centerY + lx * Math.sin(rad) + ly * Math.cos(rad);
+              const left = pageRect.left - wrapRect.left + (px / A4_WIDTH_PX) * pageRect.width;
+              const top = pageRect.top - wrapRect.top + (py / A4_HEIGHT_PX) * pageRect.height;
+              return (
+                <div
+                  key={`${sx},${sy}`}
+                  className="no-print absolute z-30 w-4 h-4 rounded-full bg-white border-2 border-indigo-500 shadow"
+                  style={{ left, top, transform: 'translate(-50%, -50%)', cursor, touchAction: 'none' }}
+                  onMouseDown={e => e.stopPropagation()}
+                  onTouchStart={e => e.stopPropagation()}
+                  onPointerDown={e => handleResizeStart(e, sx, sy)}
+                  onPointerMove={handleResizeMove}
+                  onPointerUp={handleResizeEnd}
+                  onPointerCancel={handleResizeEnd}
+                />
+              );
+            });
+          })()}
       </div>
     </div>
   );
