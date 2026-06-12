@@ -1,4 +1,4 @@
-import { Eye, EyeOff, Trash2, ChevronUp, ChevronDown, Type, Paintbrush, Layers as LayersIcon, Image as ImageIcon } from 'lucide-react';
+import { Eye, EyeOff, Trash2, ChevronUp, ChevronDown, Type, Paintbrush, Layers as LayersIcon, Image as ImageIcon, FileText } from 'lucide-react';
 import type { Layer } from './types';
 
 interface LayersPanelProps {
@@ -80,6 +80,8 @@ export default function LayersPanel({
               </button>
               {layer.type === 'draw' ? (
                 <Paintbrush size={12} className="text-slate-400 shrink-0" />
+              ) : layer.type === 'longtext' ? (
+                <FileText size={12} className="text-slate-400 shrink-0" />
               ) : (
                 <Type size={12} className="text-slate-400 shrink-0" />
               )}
