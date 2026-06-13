@@ -1,9 +1,11 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2, Undo2, Scaling, Lock, LockOpen } from 'lucide-react';
+import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2, Undo2, Scaling, Lock, LockOpen, FileText } from 'lucide-react';
 import Toolbar from './editor/Toolbar';
 import LayersPanel from './editor/LayersPanel';
-import type { Tool, Layer, TextItem } from './editor/types';
+import TextModePanel from './editor/TextModePanel';
+import type { Tool, Layer, TextItem, LongTextSettings } from './editor/types';
+import { LONG_TEXT_FONTS } from './editor/types';
 
 interface ImageState {
   src: string;
@@ -70,6 +72,9 @@ export default function App() {
   const [resizeMode, setResizeMode] = useState(false);
   const [aspectLocked, setAspectLocked] = useState(true);
   const [shapeFill, setShapeFill] = useState(false);
+  const [textMode, setTextMode] = useState(false);
+  const [textModeLayerId, setTextModeLayerId] = useState<string | null>(null);
+  const [textOverflow, setTextOverflow] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -82,7 +87,9 @@ export default function App() {
   const resizeDragRef = useRef<ResizeDragState | null>(null);
   const imageDragRef = useRef<{ startImage: ImageState; moved: boolean } | null>(null);
   const undoStack = useRef<UndoEntry[]>([]);
-  const counters = useRef({ draw: 0, text: 0, id: 0 });
+  const counters = useRef({ draw: 0, text: 0, doc: 0, id: 0 });
+  const longTextRefs = useRef(new Map<string, HTMLDivElement>());
+  const longTextSnapshotRef = useRef<Layer[] | null>(null);
 
   // A4 dimensions in pixels at 96 DPI (standard screen resolution)
   // 210mm = 793.7px, 297mm = 1122.5px
@@ -259,20 +266,35 @@ export default function App() {
 
   // ---------- Advanced mode: layers ----------
 
-  const makeLayer = (type: 'draw' | 'text'): Layer => {
+  const makeLayer = (type: Layer['type']): Layer => {
     counters.current.id += 1;
-    const n = type === 'draw' ? ++counters.current.draw : ++counters.current.text;
+    let name: string;
+    if (type === 'draw') name = `Lag ${++counters.current.draw}`;
+    else if (type === 'text') name = `Tekst ${++counters.current.text}`;
+    else name = `Dokument ${++counters.current.doc}`;
     return {
       id: `layer-${Date.now()}-${counters.current.id}`,
-      name: type === 'draw' ? `Lag ${n}` : `Tekst ${n}`,
+      name,
       type,
       visible: true,
       opacity: 1,
       textItems: [],
+      ...(type === 'longtext' ? {
+        longText: {
+          content: '',
+          fontSize: 16,
+          lineHeight: 1.5,
+          align: 'left',
+          font: 'sans',
+          color: '#1e293b',
+          margin: 60,
+          columns: 1,
+        } satisfies LongTextSettings,
+      } : {}),
     };
   };
 
-  const addLayer = (type: 'draw' | 'text') => {
+  const addLayer = (type: Layer['type']) => {
     const layer = makeLayer(type);
     setLayers(prev => [...prev, layer]);
     setActiveLayerId(layer.id);
@@ -328,6 +350,125 @@ export default function App() {
     if (!next) {
       setTool('move');
       setEditingTextId(null);
+    }
+  };
+
+  // ---------- Text mode (long-form text layer) ----------
+
+  const textModeLayer = textModeLayerId ? layers.find(l => l.id === textModeLayerId) ?? null : null;
+
+  const closeTextMode = () => {
+    setTextMode(false);
+    const layer = layers.find(l => l.id === textModeLayerId);
+    // Drop the layer again if nothing was written.
+    if (layer?.longText && !layer.longText.content.trim()) {
+      const remaining = layers.filter(l => l.id !== layer.id);
+      setLayers(remaining);
+      if (activeLayerId === layer.id) {
+        setActiveLayerId(remaining.length ? remaining[remaining.length - 1].id : null);
+      }
+    }
+    setTextModeLayerId(null);
+  };
+
+  const toggleTextMode = () => {
+    if (textMode) {
+      closeTextMode();
+      return;
+    }
+    // Re-open the most recent document layer, or create a fresh one.
+    let layer = [...layers].reverse().find(l => l.type === 'longtext');
+    if (!layer) {
+      layer = makeLayer('longtext');
+      setLayers(prev => [...prev, layer!]);
+    }
+    setActiveLayerId(layer.id);
+    setTextModeLayerId(layer.id);
+    setTextMode(true);
+  };
+
+  // If the document layer disappears (deleted or undone away), leave text mode.
+  useEffect(() => {
+    if (textMode && textModeLayerId && !layers.some(l => l.id === textModeLayerId)) {
+      setTextMode(false);
+      setTextModeLayerId(null);
+    }
+  }, [layers, textMode, textModeLayerId]);
+
+  const updateLongText = (patch: Partial<LongTextSettings>) => {
+    setLayers(prev => prev.map(l => l.id === textModeLayerId && l.longText
+      ? { ...l, longText: { ...l.longText, ...patch } }
+      : l));
+  };
+
+  // Warn when the document no longer fits on the sheet.
+  useEffect(() => {
+    if (!textModeLayerId) {
+      setTextOverflow(false);
+      return;
+    }
+    const el = longTextRefs.current.get(textModeLayerId);
+    if (!el) {
+      setTextOverflow(false);
+      return;
+    }
+    setTextOverflow(el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1);
+  }, [layers, textModeLayerId]);
+
+  // Find the largest font size that fits the sheet, via an offscreen probe.
+  const autoFitLongText = () => {
+    const settings = textModeLayer?.longText;
+    if (!settings || !settings.content.trim()) return;
+    const innerW = A4_WIDTH_PX - 2 * settings.margin;
+    const innerH = A4_HEIGHT_PX - 2 * settings.margin;
+    const colGap = 24;
+    const colW = settings.columns === 2 ? (innerW - colGap) / 2 : innerW;
+    if (colW <= 0 || innerH <= 0) return;
+
+    const probe = document.createElement('div');
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.width = `${colW}px`;
+    probe.style.whiteSpace = 'pre-wrap';
+    probe.style.overflowWrap = 'break-word';
+    probe.style.fontFamily = LONG_TEXT_FONTS[settings.font];
+    probe.style.lineHeight = String(settings.lineHeight);
+    probe.style.textAlign = settings.align;
+    probe.textContent = settings.content;
+    document.body.appendChild(probe);
+    let lo = 8;
+    let hi = 72;
+    let best = 8;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      probe.style.fontSize = `${mid}px`;
+      if (probe.scrollHeight <= innerH * settings.columns) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    probe.remove();
+    if (best !== settings.fontSize) {
+      pushUndo({ kind: 'layers', layers });
+      updateLongText({ fontSize: best });
+    }
+  };
+
+  // One undo entry per editing session in the textarea.
+  const handleLongTextFocus = () => {
+    longTextSnapshotRef.current = layers;
+  };
+
+  const handleLongTextBlur = () => {
+    const snapshot = longTextSnapshotRef.current;
+    longTextSnapshotRef.current = null;
+    if (!snapshot || !textModeLayerId) return;
+    const before = snapshot.find(l => l.id === textModeLayerId)?.longText?.content;
+    const now = layers.find(l => l.id === textModeLayerId)?.longText?.content;
+    if (before !== undefined && before !== now) {
+      pushUndo({ kind: 'layers', layers: snapshot });
     }
   };
 
@@ -755,6 +896,22 @@ export default function App() {
             </p>
           )}
 
+          <button
+            onClick={toggleTextMode}
+            className={`w-full flex items-center justify-center gap-2 p-3 rounded-xl transition-colors text-sm font-medium border ${
+              textMode
+                ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
+                : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+            }`}
+          >
+            <FileText size={16} /> Tekstmodus {textMode ? 'på' : 'av'}
+          </button>
+          {textMode && (
+            <p className="text-xs text-slate-400 -mt-2">
+              Lim inn lang tekst og formater den på arket. Teksten ligger i et eget lag.
+            </p>
+          )}
+
           <input
             type="file"
             ref={fileInputRef}
@@ -826,6 +983,19 @@ export default function App() {
           </>
         )}
 
+        {textMode && textModeLayer?.longText && (
+          <TextModePanel
+            settings={textModeLayer.longText}
+            onChange={updateLongText}
+            onClose={closeTextMode}
+            onAutoFit={autoFitLongText}
+            overflowing={textOverflow}
+            onTextFocus={handleLongTextFocus}
+            onTextBlur={handleLongTextBlur}
+            offsetForToolbar={advancedMode}
+          />
+        )}
+
         {/* A4 Container - Fixed Size 210mm x 297mm */}
         <div
           id="print-container"
@@ -890,6 +1060,38 @@ export default function App() {
               className="absolute inset-0 w-full h-full pointer-events-none"
               style={{ opacity: layer.opacity, visibility: layer.visible ? 'visible' : 'hidden' }}
             />
+          ) : layer.type === 'longtext' && layer.longText ? (
+            <div
+              key={layer.id}
+              className="absolute inset-0 pointer-events-none"
+              style={{ opacity: layer.opacity, visibility: layer.visible ? 'visible' : 'hidden' }}
+            >
+              <div
+                ref={el => {
+                  if (el) {
+                    longTextRefs.current.set(layer.id, el);
+                  } else {
+                    longTextRefs.current.delete(layer.id);
+                  }
+                }}
+                className="w-full h-full overflow-hidden"
+                style={{
+                  padding: layer.longText.margin,
+                  fontSize: layer.longText.fontSize,
+                  lineHeight: layer.longText.lineHeight,
+                  textAlign: layer.longText.align,
+                  color: layer.longText.color,
+                  fontFamily: LONG_TEXT_FONTS[layer.longText.font],
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'break-word',
+                  hyphens: 'auto',
+                  columnCount: layer.longText.columns,
+                  columnGap: 24,
+                }}
+              >
+                {layer.longText.content}
+              </div>
+            </div>
           ) : (
             <div
               key={layer.id}
