@@ -1,11 +1,12 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2, Undo2, Scaling, Lock, LockOpen, FileText } from 'lucide-react';
+import { Upload, Printer, ZoomIn, ZoomOut, RotateCw, Trash2, Image as ImageIcon, Maximize, Wand2, Undo2, Scaling, Lock, LockOpen, FileText, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import Toolbar from './editor/Toolbar';
 import LayersPanel from './editor/LayersPanel';
 import TextModePanel from './editor/TextModePanel';
 import type { Tool, Layer, TextItem, LongTextSettings } from './editor/types';
 import { LONG_TEXT_FONTS } from './editor/types';
+import { isPdfFile, openPdf, renderPdfPage, type PdfSource } from './editor/pdf';
 
 interface ImageState {
   src: string;
@@ -16,6 +17,8 @@ interface ImageState {
   rotation: number;
   natWidth: number;
   natHeight: number;
+  // Set when the image is a rendered PDF page, so other pages can be shown.
+  pdf?: PdfSource;
 }
 
 type UndoEntry =
@@ -75,8 +78,12 @@ export default function App() {
   const [textMode, setTextMode] = useState(false);
   const [textModeLayerId, setTextModeLayerId] = useState<string | null>(null);
   const [textOverflow, setTextOverflow] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState<'import' | 'page' | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // PDF work is async; read the latest image through this ref, not a stale closure.
+  const imageRef = useRef<ImageState | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
 
@@ -122,35 +129,87 @@ export default function App() {
     return () => window.removeEventListener('resize', updateScale);
   }, []);
 
+  useEffect(() => {
+    imageRef.current = image;
+  }, [image]);
+
+  // Contained within the page (never upscaled), centered.
+  const containedBox = (natWidth: number, natHeight: number) => {
+    const s = Math.min(1, A4_WIDTH_PX / natWidth, A4_HEIGHT_PX / natHeight);
+    const width = natWidth * s;
+    const height = natHeight * s;
+    return { x: (A4_WIDTH_PX - width) / 2, y: (A4_HEIGHT_PX - height) / 2, width, height };
+  };
+
+  const placeNewImage = (src: string, natWidth: number, natHeight: number, pdf?: PdfSource) => {
+    pushUndo({ kind: 'image', image: imageRef.current });
+    setImage({ src, ...containedBox(natWidth, natHeight), rotation: 0, natWidth, natHeight, pdf });
+    setImageVisible(true);
+  };
+
+  const importPdf = async (file: File) => {
+    setPdfBusy('import');
+    try {
+      const doc = await openPdf(file);
+      if (!doc) return;
+      const page = await renderPdfPage(doc, 1);
+      placeNewImage(page.src, page.natWidth, page.natHeight, {
+        doc,
+        fileName: file.name,
+        page: 1,
+        pageCount: doc.numPages,
+      });
+    } catch (err) {
+      console.error(err);
+      setImportError('Kunne ikke lese PDF-filen.');
+    } finally {
+      setPdfBusy(null);
+    }
+  };
+
+  const showPdfPage = async (pageNumber: number) => {
+    const pdf = image?.pdf;
+    if (!pdf || pdfBusy || pageNumber < 1 || pageNumber > pdf.pageCount || pageNumber === pdf.page) return;
+    setImportError(null);
+    setPdfBusy('page');
+    try {
+      const page = await renderPdfPage(pdf.doc, pageNumber);
+      const current = imageRef.current;
+      // The PDF may have been removed or replaced while the page rendered.
+      if (!current?.pdf || current.pdf.doc !== pdf.doc) return;
+      // Pages of the same size keep the current zoom, position and rotation so
+      // they line up; a page of another size is fitted to the sheet afresh.
+      const sameSize = Math.abs(page.natWidth - current.natWidth) < 1 && Math.abs(page.natHeight - current.natHeight) < 1;
+      pushUndo({ kind: 'image', image: current });
+      setImage({
+        ...current,
+        ...(sameSize ? {} : { ...containedBox(page.natWidth, page.natHeight), rotation: 0 }),
+        src: page.src,
+        natWidth: page.natWidth,
+        natHeight: page.natHeight,
+        pdf: { ...current.pdf, page: pageNumber },
+      });
+    } catch (err) {
+      console.error(err);
+      setImportError('Kunne ikke vise siden.');
+    } finally {
+      setPdfBusy(null);
+    }
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
+    setImportError(null);
+    if (file && isPdfFile(file)) {
+      importPdf(file);
+    } else if (file) {
       const reader = new FileReader();
       reader.onload = (event) => {
         const src = event.target?.result;
         if (typeof src !== 'string') return;
         // Read natural dimensions so transforms can work around the center.
         const img = new Image();
-        img.onload = () => {
-          const natWidth = img.naturalWidth || 1;
-          const natHeight = img.naturalHeight || 1;
-          // Start contained within the page, centered.
-          const s = Math.min(1, A4_WIDTH_PX / natWidth, A4_HEIGHT_PX / natHeight);
-          const width = natWidth * s;
-          const height = natHeight * s;
-          pushUndo({ kind: 'image', image });
-          setImage({
-            src,
-            x: (A4_WIDTH_PX - width) / 2,
-            y: (A4_HEIGHT_PX - height) / 2,
-            width,
-            height,
-            rotation: 0,
-            natWidth,
-            natHeight,
-          });
-          setImageVisible(true);
-        };
+        img.onload = () => placeNewImage(src, img.naturalWidth || 1, img.naturalHeight || 1);
         img.src = src;
       };
       reader.readAsDataURL(file);
@@ -786,6 +845,7 @@ export default function App() {
   ];
 
   const hasContent = image !== null || layers.length > 0;
+  const pdf = image?.pdf;
 
   return (
     <div className="h-screen flex flex-col md:flex-row bg-slate-100 font-sans overflow-hidden">
@@ -802,17 +862,69 @@ export default function App() {
         <div className="space-y-4">
           {!image ? (
             <div
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => !pdfBusy && fileInputRef.current?.click()}
               className="border-2 border-dashed border-slate-300 rounded-2xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:border-indigo-500 hover:bg-indigo-50 transition-colors group h-48"
             >
               <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mb-3 group-hover:bg-white group-hover:shadow-sm transition-all">
-                <Upload className="text-slate-400 group-hover:text-indigo-600" size={24} />
+                {pdfBusy === 'import' ? (
+                  <Loader2 className="text-indigo-600 animate-spin" size={24} />
+                ) : (
+                  <Upload className="text-slate-400 group-hover:text-indigo-600" size={24} />
+                )}
               </div>
-              <p className="font-medium text-slate-700">Last opp bilde</p>
+              <p className="font-medium text-slate-700">{pdfBusy === 'import' ? 'Leser PDF …' : 'Last opp bilde eller PDF'}</p>
               <p className="text-xs text-slate-500 mt-1">Klikk for å velge fil</p>
             </div>
           ) : (
             <div className="space-y-4">
+              {pdf && (
+                <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-xs font-semibold uppercase text-slate-500 tracking-wider">PDF</span>
+                    {pdfBusy === 'page' ? (
+                      <Loader2 size={14} className="text-indigo-500 animate-spin" />
+                    ) : (
+                      <span className="text-xs font-mono text-slate-400">{pdf.pageCount} {pdf.pageCount === 1 ? 'side' : 'sider'}</span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 text-sm text-slate-700" title={pdf.fileName}>
+                    <FileText size={14} className="text-slate-400 shrink-0" />
+                    <span className="truncate">{pdf.fileName}</span>
+                  </div>
+
+                  {pdf.pageCount > 1 && (
+                    <div className="flex items-center gap-2 mt-3">
+                      <button
+                        title="Forrige side"
+                        onClick={() => showPdfPage(pdf.page - 1)}
+                        disabled={!!pdfBusy || pdf.page <= 1}
+                        className="p-2 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white"
+                      >
+                        <ChevronLeft size={16} />
+                      </button>
+                      <select
+                        value={pdf.page}
+                        onChange={(e) => showPdfPage(Number(e.target.value))}
+                        disabled={!!pdfBusy}
+                        className="flex-1 min-w-0 p-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 disabled:opacity-60"
+                      >
+                        {Array.from({ length: pdf.pageCount }, (_, i) => (
+                          <option key={i} value={i + 1}>Side {i + 1} av {pdf.pageCount}</option>
+                        ))}
+                      </select>
+                      <button
+                        title="Neste side"
+                        onClick={() => showPdfPage(pdf.page + 1)}
+                        disabled={!!pdfBusy || pdf.page >= pdf.pageCount}
+                        className="p-2 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 hover:border-slate-300 transition-all text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-white"
+                      >
+                        <ChevronRight size={16} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-xs font-semibold uppercase text-slate-500 tracking-wider">Justering</span>
@@ -867,9 +979,13 @@ export default function App() {
                 onClick={clear}
                 className="w-full flex items-center justify-center gap-2 p-3 text-red-600 bg-red-50 hover:bg-red-100 rounded-xl transition-colors text-sm font-medium"
               >
-                <Trash2 size={16} /> Fjern bilde
+                <Trash2 size={16} /> {pdf ? 'Fjern PDF' : 'Fjern bilde'}
               </button>
             </div>
+          )}
+
+          {importError && (
+            <p className="text-xs text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{importError}</p>
           )}
 
           <button
@@ -916,7 +1032,7 @@ export default function App() {
             type="file"
             ref={fileInputRef}
             onChange={handleFileChange}
-            accept="image/*"
+            accept="image/*,application/pdf,.pdf"
             className="hidden"
           />
         </div>
@@ -977,6 +1093,7 @@ export default function App() {
               onAddText={() => addLayer('text')}
               onOpacityChange={setLayerOpacity}
               hasImage={!!image}
+              imageLabel={pdf ? `PDF, side ${pdf.page}` : 'Bilde'}
               imageVisible={imageVisible}
               onToggleImageVisible={() => setImageVisible(v => !v)}
             />
@@ -1040,7 +1157,7 @@ export default function App() {
           {!image && layers.length === 0 && (
             <div className="w-full h-full flex flex-col items-center justify-center text-slate-300 border-2 border-dashed border-slate-100 m-4 rounded-xl" style={{width: 'calc(100% - 2rem)', height: 'calc(100% - 2rem)'}}>
               <ImageIcon size={48} className="mb-4 opacity-50" />
-              <p className="text-sm font-medium">Ingen bilde valgt</p>
+              <p className="text-sm font-medium">Ingen bilde eller PDF valgt</p>
             </div>
           )}
 

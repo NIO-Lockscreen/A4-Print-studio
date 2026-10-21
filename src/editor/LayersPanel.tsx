@@ -12,6 +12,7 @@ interface LayersPanelProps {
   onAddText: () => void;
   onOpacityChange: (id: string, opacity: number) => void;
   hasImage: boolean;
+  imageLabel: string;
   imageVisible: boolean;
   onToggleImageVisible: () => void;
 }
@@ -27,6 +28,7 @@ export default function LayersPanel({
   onAddText,
   onOpacityChange,
   hasImage,
+  imageLabel,
   imageVisible,
   onToggleImageVisible,
 }: LayersPanelProps) {
@@ -134,7 +136,7 @@ export default function LayersPanel({
               {imageVisible ? <Eye size={14} /> : <EyeOff size={14} />}
             </button>
             <ImageIcon size={12} className="text-slate-400 shrink-0" />
-            <span className="text-sm text-slate-500 italic flex-1">Bilde (bakgrunn)</span>
+            <span className="text-sm text-slate-500 italic flex-1 truncate">{imageLabel} (bakgrunn)</span>
           </div>
         )}
 
